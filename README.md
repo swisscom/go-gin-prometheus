@@ -1,11 +1,12 @@
 # go-gin-prometheus
-[![](https://godoc.org/github.com/zsais/go-gin-prometheus?status.svg)](https://godoc.org/github.com/zsais/go-gin-prometheus) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![](https://godoc.org/github.com/swisscom/go-gin-prometheus?status.svg)](https://godoc.org/github.com/swisscom/go-gin-prometheus) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Gin Web Framework Prometheus metrics exporter
+Gin Web Framework Prometheus metrics exporter, based on the original work 
+by [@zsais](https://github.com/zsais) [`zsais/go-gin-prometheus`](https://github.com/zsais/go-gin-prometheus).
 
 ## Installation
 
-`$ go get github.com/zsais/go-gin-prometheus`
+`$ go get github.com/swisscom/go-gin-prometheus`
 
 ## Usage
 
@@ -14,13 +15,13 @@ package main
 
 import (
 	"github.com/gin-gonic/gin"
-	"github.com/zsais/go-gin-prometheus"
+	promgin "github.com/swisscom/go-gin-prometheus"
 )
 
 func main() {
 	r := gin.New()
 
-	p := ginprometheus.NewPrometheus("gin")
+	p := promgin.NewPrometheus("gin")
 	p.Use(r)
 
 	r.GET("/", func(c *gin.Context) {
@@ -31,7 +32,7 @@ func main() {
 }
 ```
 
-See the [example.go file](https://github.com/zsais/go-gin-prometheus/blob/master/example/example.go)
+See the [example.go file](https://github.com/swisscom/go-gin-prometheus/blob/master/example/example.go)
 
 ## Preserving a low cardinality for the request counter
 
@@ -52,7 +53,7 @@ package main
 
 import (
 	"github.com/gin-gonic/gin"
-	"github.com/zsais/go-gin-prometheus"
+	"github.com/swisscom/go-gin-prometheus"
 )
 
 func main() {

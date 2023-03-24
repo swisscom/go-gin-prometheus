@@ -1,9 +1,11 @@
-package ginprometheus
+package promgin
 
 import (
 	"bytes"
-	"io/ioutil"
+	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"time"
@@ -16,63 +18,26 @@ import (
 
 var defaultMetricPath = "/metrics"
 
-// Standard default metrics
-//	counter, counter_vec, gauge, gauge_vec,
-//	histogram, histogram_vec, summary, summary_vec
-var reqCnt = &Metric{
-	ID:          "reqCnt",
-	Name:        "requests_total",
-	Description: "How many HTTP requests processed, partitioned by status code and HTTP method.",
-	Type:        "counter_vec",
-	Args:        []string{"code", "method", "handler", "host", "url"}}
-
-var reqDur = &Metric{
-	ID:          "reqDur",
-	Name:        "request_duration_seconds",
-	Description: "The HTTP request latencies in seconds.",
-	Type:        "histogram_vec",
-	Args:        []string{"code", "method", "url"},
-}
-
-var resSz = &Metric{
-	ID:          "resSz",
-	Name:        "response_size_bytes",
-	Description: "The HTTP response sizes in bytes.",
-	Type:        "summary"}
-
-var reqSz = &Metric{
-	ID:          "reqSz",
-	Name:        "request_size_bytes",
-	Description: "The HTTP request sizes in bytes.",
-	Type:        "summary"}
-
-var standardMetrics = []*Metric{
-	reqCnt,
-	reqDur,
-	resSz,
-	reqSz,
-}
-
 /*
-RequestCounterURLLabelMappingFn is a function which can be supplied to the middleware to control
+RequestUrlMappingFn is a function which can be supplied to the middleware to control
 the cardinality of the request counter's "url" label, which might be required in some contexts.
 For instance, if for a "/customer/:name" route you don't want to generate a time series for every
 possible customer name, you could use this function:
 
-func(c *gin.Context) string {
-	url := c.Request.URL.Path
-	for _, p := range c.Params {
-		if p.Key == "name" {
-			url = strings.Replace(url, p.Value, ":name", 1)
-			break
+	func(c *gin.Context) string {
+		url := c.Request.URL.Path
+		for _, p := range c.Params {
+			if p.Key == "name" {
+				url = strings.Replace(url, p.Value, ":name", 1)
+				break
+			}
 		}
+		return url
 	}
-	return url
-}
 
 which would map "/customer/alice" and "/customer/bob" to their template "/customer/:name".
 */
-type RequestCounterURLLabelMappingFn func(c *gin.Context) string
+type RequestUrlMappingFn func(c *gin.Context) string
 
 // Metric is a definition for the name, description, type, ID, and
 // prometheus.Collector type (i.e. CounterVec, Summary, etc) of each metric
@@ -87,17 +52,18 @@ type Metric struct {
 
 // Prometheus contains the metrics gathered by the instance and its path
 type Prometheus struct {
-	reqCnt        *prometheus.CounterVec
-	reqDur        *prometheus.HistogramVec
-	reqSz, resSz  prometheus.Summary
-	router        *gin.Engine
-	listenAddress string
-	Ppg           PrometheusPushGateway
+	requestCounter                      *prometheus.CounterVec
+	abortedCounter                      *prometheus.CounterVec
+	requestDurationMs                   *prometheus.HistogramVec
+	requestSizeBytes, responseSizeBytes prometheus.Summary
+	router                              *gin.Engine
+	listenAddress                       string
+	Ppg                                 PrometheusPushGateway
 
 	MetricsList []*Metric
 	MetricsPath string
 
-	ReqCntURLLabelMappingFn RequestCounterURLLabelMappingFn
+	RequestUrlMappingFn RequestUrlMappingFn
 
 	// gin.Context string to use as a prometheus URL label
 	URLLabelFromContext string
@@ -123,7 +89,6 @@ type PrometheusPushGateway struct {
 
 // NewPrometheus generates a new set of metrics with a certain subsystem name
 func NewPrometheus(subsystem string, customMetricsList ...[]*Metric) *Prometheus {
-
 	var metricsList []*Metric
 
 	if len(customMetricsList) > 1 {
@@ -139,13 +104,12 @@ func NewPrometheus(subsystem string, customMetricsList ...[]*Metric) *Prometheus
 	p := &Prometheus{
 		MetricsList: metricsList,
 		MetricsPath: defaultMetricPath,
-		ReqCntURLLabelMappingFn: func(c *gin.Context) string {
-			return c.Request.URL.Path // i.e. by default do nothing, i.e. return URL as is
+		RequestUrlMappingFn: func(c *gin.Context) string {
+			return c.FullPath() // for example, /user/:id
 		},
 	}
 
 	p.registerMetrics(subsystem)
-
 	return p
 }
 
@@ -185,10 +149,10 @@ func (p *Prometheus) SetListenAddressWithRouter(listenAddress string, r *gin.Eng
 func (p *Prometheus) SetMetricsPath(e *gin.Engine) {
 
 	if p.listenAddress != "" {
-		p.router.GET(p.MetricsPath, prometheusHandler())
+		p.router.GET(p.MetricsPath, promHandler())
 		p.runServer()
 	} else {
-		e.GET(p.MetricsPath, prometheusHandler())
+		e.GET(p.MetricsPath, promHandler())
 	}
 }
 
@@ -196,10 +160,10 @@ func (p *Prometheus) SetMetricsPath(e *gin.Engine) {
 func (p *Prometheus) SetMetricsPathWithAuth(e *gin.Engine, accounts gin.Accounts) {
 
 	if p.listenAddress != "" {
-		p.router.GET(p.MetricsPath, gin.BasicAuth(accounts), prometheusHandler())
+		p.router.GET(p.MetricsPath, gin.BasicAuth(accounts), promHandler())
 		p.runServer()
 	} else {
-		e.GET(p.MetricsPath, gin.BasicAuth(accounts), prometheusHandler())
+		e.GET(p.MetricsPath, gin.BasicAuth(accounts), promHandler())
 	}
 
 }
@@ -214,7 +178,7 @@ func (p *Prometheus) getMetrics() []byte {
 	response, _ := http.Get(p.Ppg.MetricsURL)
 
 	defer response.Body.Close()
-	body, _ := ioutil.ReadAll(response.Body)
+	body, _ := io.ReadAll(response.Body)
 
 	return body
 }
@@ -224,7 +188,7 @@ func (p *Prometheus) getPushGatewayURL() string {
 	if p.Ppg.Job == "" {
 		p.Ppg.Job = "gin"
 	}
-	return p.Ppg.PushGatewayURL + "/metrics/job/" + p.Ppg.Job + "/instance/" + h
+	return p.Ppg.PushGatewayURL + "/metrics/job/" + url.PathEscape(p.Ppg.Job) + "/instance/" + url.PathEscape(h)
 }
 
 func (p *Prometheus) sendMetricsToPushGateway(metrics []byte) {
@@ -328,14 +292,14 @@ func (p *Prometheus) registerMetrics(subsystem string) {
 			log.WithError(err).Errorf("%s could not be registered in Prometheus", metricDef.Name)
 		}
 		switch metricDef {
-		case reqCnt:
-			p.reqCnt = metric.(*prometheus.CounterVec)
-		case reqDur:
-			p.reqDur = metric.(*prometheus.HistogramVec)
-		case resSz:
-			p.resSz = metric.(prometheus.Summary)
-		case reqSz:
-			p.reqSz = metric.(prometheus.Summary)
+		case requestCount:
+			p.requestCounter = metric.(*prometheus.CounterVec)
+		case requestDurationMs:
+			p.requestDurationMs = metric.(*prometheus.HistogramVec)
+		case responseSizeBytes:
+			p.responseSizeBytes = metric.(prometheus.Summary)
+		case requestSizeBytes:
+			p.requestSizeBytes = metric.(prometheus.Summary)
 		}
 		metricDef.MetricCollector = metric
 	}
@@ -357,20 +321,22 @@ func (p *Prometheus) UseWithAuth(e *gin.Engine, accounts gin.Accounts) {
 func (p *Prometheus) HandlerFunc() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if c.Request.URL.Path == p.MetricsPath {
+			// Skip metrics for the /metrics path
 			c.Next()
 			return
 		}
 
 		start := time.Now()
 		reqSz := computeApproximateRequestSize(c.Request)
-
 		c.Next()
 
+		reqEnd := time.Now()
+
 		status := strconv.Itoa(c.Writer.Status())
-		elapsed := float64(time.Since(start)) / float64(time.Second)
+		elapsed := reqEnd.Sub(start).Seconds()
 		resSz := float64(c.Writer.Size())
 
-		url := p.ReqCntURLLabelMappingFn(c)
+		url := p.RequestUrlMappingFn(c)
 		// jlambert Oct 2018 - sidecar specific mod
 		if len(p.URLLabelFromContext) > 0 {
 			u, found := c.Get(p.URLLabelFromContext)
@@ -379,14 +345,28 @@ func (p *Prometheus) HandlerFunc() gin.HandlerFunc {
 			}
 			url = u.(string)
 		}
-		p.reqDur.WithLabelValues(status, c.Request.Method, url).Observe(elapsed)
-		p.reqCnt.WithLabelValues(status, c.Request.Method, c.HandlerName(), c.Request.Host, url).Inc()
-		p.reqSz.Observe(float64(reqSz))
-		p.resSz.Observe(resSz)
+		p.requestDurationMs.WithLabelValues(status, c.Request.Method, url).Observe(elapsed)
+		p.requestCounter.WithLabelValues(
+			status,
+			c.Request.Method,
+			c.HandlerName(),
+			boolFmt(c.IsAborted()),
+			boolFmt(c.IsWebsocket()),
+			c.ContentType(),
+			c.Request.Proto,
+			c.Request.Host,
+			url,
+		).Inc()
+		p.requestSizeBytes.Observe(float64(reqSz))
+		p.responseSizeBytes.Observe(resSz)
 	}
 }
 
-func prometheusHandler() gin.HandlerFunc {
+func boolFmt(b bool) string {
+	return fmt.Sprintf("%v", b)
+}
+
+func promHandler() gin.HandlerFunc {
 	h := promhttp.Handler()
 	return func(c *gin.Context) {
 		h.ServeHTTP(c.Writer, c.Request)
